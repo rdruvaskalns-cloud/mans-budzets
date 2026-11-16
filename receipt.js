@@ -1,4 +1,4 @@
-/* Mans Budžets 2.4: receipt import, on-device OCR and reconciled payment recording. */
+/* Mans Budžets 2.5: receipt import, dual-pass OCR and reconciled payment recording. */
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
@@ -18,6 +18,8 @@
       return;
     }
     file = selected;
+    items = []; payment = null;
+    $('receiptEditor').classList.add('hidden');
     const url = URL.createObjectURL(file);
     preview.onload = () => URL.revokeObjectURL(url);
     preview.src = url;
@@ -46,7 +48,9 @@
     $('receiptPaymentInfo').textContent = details.join(' · ') || 'Maksāšanas veidu pārbaudi un nepieciešamības gadījumā izlabo.';
     draw();
     const knownTotal = result.paidTotal !== null ? `, čeka kopsumma ${eur(result.paidTotal)}` : '; čeka kopsumma nav droši atrasta';
-    $('ocrStatus').textContent = `Atpazīts veikals: ${result.store}; preces: ${items.length}${knownTotal}. Pārbaudi pirms saglabāšanas.`;
+    const quality = result.reconciled ? 'Preču summa sakrīt ar maksājumu.' :
+      (result.discrepancyCents === null ? 'Nevar pārbaudīt kopsummu.' : `Trūkst vai ir lieki ${eur(Math.abs(result.discrepancyCents) / 100)}. Pārbaudi, vai nolasītas VISAS preces.`);
+    $('ocrStatus').textContent = `Atpazīts veikals: ${result.store}; preces: ${items.length}${knownTotal}. ${quality}`;
   }
   function draw() {
     const root = $('receiptLines'); root.replaceChildren();
@@ -95,54 +99,125 @@
       document.head.append(script);
     });
   }
-  // Optional contrast normalization for wrinkled thermal receipts, entirely on-device.
-  async function imageForOcr(source) {
-    if (!$('enhanceReceipt').checked || !('createImageBitmap' in window)) return source;
+  // 2.5: Attempt to find the bright central receipt in gallery screenshots.
+  // Everything happens on-device; images never leave the phone.
+  function cropReceipt(bitmap) {
+    if (!$('autoCropReceipt')?.checked) return { x: 0, y: 0, width: bitmap.width, height: bitmap.height };
+    const sample = document.createElement('canvas');
+    sample.width = 220;
+    sample.height = Math.max(80, Math.round(bitmap.height * 220 / bitmap.width));
+    if (sample.height > 550) { sample.width = Math.round(220 * 550 / sample.height); sample.height = 550; }
+    const ctx = sample.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bitmap, 0, 0, sample.width, sample.height);
+    const data = ctx.getImageData(0, 0, sample.width, sample.height).data;
+    const w = sample.width, h = sample.height;
+    const light = (x, y) => { const i = (y * w + x) * 4; return data[i] * .299 + data[i + 1] * .587 + data[i + 2] * .114 > 185; };
+    // Find the widest bright band, except header and the bottom phone controls.
+    const xVotes = [];
+    const startY = Math.floor(h * .12), endY = Math.ceil(h * .87);
+    for (let x = 0; x < w; x++) {
+      let lit = 0;
+      for (let y = startY; y < endY; y += 2) if (light(x, y)) lit++;
+      xVotes.push(lit / Math.ceil((endY - startY) / 2) > .37);
+    }
+    const largestRun = votes => {
+      let winner = { start: 0, end: votes.length - 1, length: 0 }, begin = -1;
+      for (let i = 0; i <= votes.length; i++) {
+        if (i < votes.length && votes[i]) { if (begin < 0) begin = i; }
+        else if (begin >= 0) {
+          const run = { start: begin, end: i - 1, length: i - begin };
+          if (run.length > winner.length) winner = run;
+          begin = -1;
+        }
+      }
+      return winner;
+    };
+    const xs = largestRun(xVotes);
+    if (xs.length < w * .23) return { x: 0, y: 0, width: bitmap.width, height: bitmap.height };
+    const rowVotes = [];
+    const stride = Math.max(1, Math.floor(xs.length / 80));
+    for (let y = 0; y < h; y++) {
+      let lit = 0, all = 0;
+      for (let x = xs.start; x <= xs.end; x += stride) { all++; if (light(x, y)) lit++; }
+      rowVotes.push(lit / all > .50);
+    }
+    const ys = largestRun(rowVotes);
+    if (ys.length < h * .12) return { x: 0, y: 0, width: bitmap.width, height: bitmap.height };
+    const padX = Math.max(4, Math.round(w * .025)), padY = Math.max(6, Math.round(h * .024));
+    const x1 = Math.max(0, xs.start - padX), x2 = Math.min(w, xs.end + padX + 1);
+    const y1 = Math.max(0, ys.start - padY), y2 = Math.min(h, ys.end + padY + 1);
+    // Avoid unhelpful crops of almost entire source or a suspiciously small region.
+    if ((x2 - x1) / w > .96 && (y2 - y1) / h > .96 || (x2 - x1) / w < .20) {
+      return { x: 0, y: 0, width: bitmap.width, height: bitmap.height };
+    }
+    return { x: Math.floor(x1 / w * bitmap.width), y: Math.floor(y1 / h * bitmap.height),
+      width: Math.ceil((x2 - x1) / w * bitmap.width), height: Math.ceil((y2 - y1) / h * bitmap.height) };
+  }
+  async function imageForOcr(source, enhanced = true) {
+    if (!('createImageBitmap' in window)) return source;
     const bitmap = await createImageBitmap(source);
     try {
-      const scale = Math.min(1.8, 2300 / Math.max(bitmap.width, bitmap.height));
+      const rect = cropReceipt(bitmap), maxDim = Math.max(rect.width, rect.height);
+      const scale = Math.min(2.2, 2700 / maxDim);
       const canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-      const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      for (let i = 0; i < data.data.length; i += 4) {
-        const r = data.data[i], g = data.data[i + 1], b = data.data[i + 2];
-        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-        const v = Math.max(0, Math.min(255, (gray - 135) * 1.45 + 155));
-        data.data[i] = data.data[i + 1] = data.data[i + 2] = v;
+      canvas.width = Math.max(1, Math.round(rect.width * scale));
+      canvas.height = Math.max(1, Math.round(rect.height * scale));
+      const ctx = canvas.getContext('2d', { willReadFrequently: enhanced });
+      ctx.fillStyle = 'white'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(bitmap, rect.x, rect.y, rect.width, rect.height, 0, 0, canvas.width, canvas.height);
+      if (enhanced) {
+        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        for (let i = 0; i < img.data.length; i += 4) {
+          const v = .299 * img.data[i] + .587 * img.data[i + 1] + .114 * img.data[i + 2];
+          const adjusted = Math.round(Math.min(255, Math.max(0, (v - 128) * 1.33 + 134)));
+          img.data[i] = img.data[i + 1] = img.data[i + 2] = adjusted;
+        }
+        ctx.putImageData(img, 0, 0);
       }
-      ctx.putImageData(data, 0, 0);
-      return await new Promise((resolve, reject) => canvas.toBlob(b => b ? resolve(b) : reject(Error('Attēla apstrādes kļūda')), 'image/png'));
+      return await new Promise((resolve, reject) => canvas.toBlob(b => b ? resolve(b) : reject(Error('Neizdevās apstrādāt attēlu')), 'image/png'));
     } finally { bitmap.close(); }
+  }
+  function qualityOf(parsed, confidence) {
+    const gap = parsed.discrepancyCents === null ? 99999 : Math.abs(parsed.discrepancyCents);
+    return (parsed.reconciled ? 200 : Math.max(-80, 45 - gap / 7)) +
+      (parsed.paidTotal === null ? -20 : 25) + Math.min(60, parsed.items.length * 8) +
+      (['Rimi', 'Maxima', 'Būvniecības ABC', 'Lidl', 'DEPO'].includes(parsed.store) ? 20 : 0) +
+      Math.min(10, Number(confidence || 0) / 10);
   }
   $('scanReceipt').onclick = async () => {
     if (!file) { $('ocrStatus').textContent = 'Vispirms izvēlies čeka attēlu.'; return; }
     const button = $('scanReceipt'); button.disabled = true;
+    let worker;
     try {
-      $('ocrStatus').textContent = 'Ielādē OCR bibliotēku…';
+      $('ocrStatus').textContent = 'Ielādē teksta atpazīšanu…';
       await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js');
-      let source = file;
-      if ($('enhanceReceipt').checked) {
-        $('ocrStatus').textContent = 'Uzlabo čeka attēla kontrastu…';
-        try { source = await imageForOcr(file); }
-        catch { source = file; }
-      }
-      $('ocrStatus').textContent = 'Atpazīst čeku…';
-      const worker = await Tesseract.createWorker('lav+eng', 1, { logger: m => {
+      $('ocrStatus').textContent = 'Sagatavo čeka attēlu…';
+      const firstSource = await imageForOcr(file, $('enhanceReceipt').checked);
+      worker = await Tesseract.createWorker('lav+eng', 1, { logger: m => {
         if (m.status === 'recognizing text') $('ocrStatus').textContent = `Atpazīst čeku… ${Math.round((m.progress || 0) * 100)}%`;
       }});
-      let result;
-      try { result = await worker.recognize(source); } finally { await worker.terminate(); }
-      $('ocrText').value = result.data.text;
-      readText(result.data.text);
-      if (!items.length) $('ocrStatus').textContent += ' Ja netika atrastas preces, atslēdz kontrasta uzlabošanu un mēģini vēlreiz.';
+      await worker.setParameters({ tessedit_pageseg_mode: '4', preserve_interword_spaces: '1' });
+      const first = (await worker.recognize(firstSource)).data;
+      const attempt = [{ text: first.text, parsed: parser.parse(first.text), confidence: first.confidence }];
+      if (!attempt[0].parsed.reconciled) {
+        $('ocrStatus').textContent = 'Pirmā atpazīšana nav pilnīga. Pārbauda vēl vienu variantu…';
+        await worker.setParameters({ tessedit_pageseg_mode: '6', preserve_interword_spaces: '1' });
+        const alternativeSource = await imageForOcr(file, !$('enhanceReceipt').checked);
+        const second = (await worker.recognize(alternativeSource)).data;
+        attempt.push({ text: second.text, parsed: parser.parse(second.text), confidence: second.confidence });
+      }
+      attempt.sort((a, b) => qualityOf(b.parsed, b.confidence) - qualityOf(a.parsed, a.confidence));
+      $('ocrText').value = attempt[0].text;
+      readText(attempt[0].text);
+      if (!items.length) $('ocrStatus').textContent += ' Pamēģini citu foto ar taisnu, skaidri salasāmu čeku.';
     } catch (error) {
-      $('ocrStatus').textContent = `Atpazīšana neizdevās: ${error.message}. Preces vari pievienot manuāli.`;
+      $('ocrStatus').textContent = `Atpazīšana neizdevās: ${error.message}. Vari atvērt teksta lauku un ievadīt čeka datus manuāli.`;
       $('receiptEditor').classList.remove('hidden');
       draw();
-    } finally { button.disabled = false; }
+    } finally {
+      if (worker) try { await worker.terminate(); } catch {}
+      button.disabled = false;
+    }
   };
   $('saveReceipt').onclick = () => {
     const v = validation();
