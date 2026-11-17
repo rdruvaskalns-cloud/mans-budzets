@@ -1,4 +1,4 @@
-/* Mans Budžets 2.5: receipt import, dual-pass OCR and reconciled payment recording. */
+/* Mans Budžets 2.6: receipt import, dual-pass OCR and reconciled payment recording. */
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
@@ -244,8 +244,9 @@
       amount: (priceCents[i] - loyaltyShares[i]) / 100,
       type: 'expense', category: x.category, account,
       receiptId, receiptFingerprint: fingerprint,
+      receiptStore: store, receiptItemName: x.name.trim(),
       receiptOriginalPrice: priceCents[i] / 100, receiptLoyaltyApplied: loyaltyShares[i] / 100
-    })).filter(x => x.amount > 0);
+    })); // Keep even fully loyalty-paid lines so the complete receipt remains editable.
     const newState = { ...state, transactions: [...state.transactions, ...transactions] };
     try { localStorage.setItem('mansBudzetsV1', JSON.stringify(newState)); }
     catch { alert('Neizdevās saglabāt. Pārbaudi telefona datu krātuvi.'); return; }
